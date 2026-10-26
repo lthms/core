@@ -62,7 +62,7 @@ impl<'a> DynToken<'a> {
             DynToken::Word(_) => 1,
             DynToken::PackedSeq(_) => 1,
             DynToken::FixedSeq(contents, _) => {
-                contents.iter().map(Self::minimum_words).sum::<usize>()
+                contents.iter().fold(0usize, |sum, token| sum.saturating_add(token.minimum_words()))
             }
             DynToken::DynSeq { .. } => 1,
         }
@@ -139,17 +139,20 @@ impl<'a> DynToken<'a> {
 
     /// Decodes from a decoder, populating the structure with the decoded data.
     #[inline]
-    pub(crate) fn decode_populate(&mut self, dec: &mut Decoder<'a>) -> Result<()> {
+    pub(crate) fn decode_populate(&mut self, dec: &mut Decoder<'a, '_>) -> Result<()> {
         match self {
             Self::Word(w) => *w = WordToken::decode_from(dec)?.0,
             Self::FixedSeq(..) => {
-                let dynamic = self.is_dynamic();
-                let mut child = if dynamic { dec.take_indirection() } else { dec.raw_child() }?;
-
-                self.decode_sequence_populate(&mut child)?;
-
-                if !dynamic {
-                    dec.take_offset_from(&child);
+                if self.is_dynamic() {
+                    let mut child = dec.take_indirection()?;
+                    self.decode_sequence_populate(&mut child)?;
+                } else {
+                    let offset = {
+                        let mut child = dec.raw_child()?;
+                        self.decode_sequence_populate(&mut child)?;
+                        dec.offset_from_child(&child)
+                    };
+                    dec.set_offset(offset);
                 }
             }
             Self::DynSeq { contents, template } => {
@@ -164,7 +167,8 @@ impl<'a> DynToken<'a> {
                 // This expect is safe because this is only invoked after
                 // `empty_dyn_token()` which always sets template
                 let template = template.take().expect("no template for dynamic sequence");
-                if template.minimum_words() == 0 {
+                let minimum_words = template.minimum_words();
+                if minimum_words == 0 {
                     // Arrays of zero-sized elements can encode an attacker-controlled length
                     // without corresponding element data. Preserve the empty representation used
                     // by zero-sized top-level arrays instead of allocating `size` elements.
@@ -178,10 +182,10 @@ impl<'a> DynToken<'a> {
                 // word AFTER the array size
                 let mut child = child.raw_child()?;
 
-                // Check that the decoder contains enough words to decode the
-                // sequence. Each item in the sequence is at least one word, so
-                // the remaining words must be at least the size of the sequence
-                if child.remaining_words() < template.minimum_words() * size {
+                let required_words =
+                    minimum_words.checked_mul(size).ok_or(alloy_sol_types::Error::Overrun)?;
+                child.set_strict_head_words(required_words)?;
+                if child.remaining_words() < required_words {
                     return Err(alloy_sol_types::Error::Overrun.into());
                 }
 
@@ -189,6 +193,7 @@ impl<'a> DynToken<'a> {
                     // re-use the box allocation
                     unsafe { Vec::from_raw_parts(Box::into_raw(template), 1, 1) }
                 } else {
+                    child.reserve_elements::<Self>(size)?;
                     try_vec![*template; size]?
                 };
 
@@ -206,19 +211,28 @@ impl<'a> DynToken<'a> {
     /// Decode a sequence from the decoder, populating the data by consuming
     /// decoder words.
     #[inline]
-    pub(crate) fn decode_sequence_populate(&mut self, dec: &mut Decoder<'a>) -> Result<()> {
+    pub(crate) fn decode_sequence_populate(&mut self, dec: &mut Decoder<'a, '_>) -> Result<()> {
         match self {
             Self::FixedSeq(buf, size) => {
+                let head_words = buf
+                    .iter()
+                    .take(*size)
+                    .try_fold(0usize, |sum, item| sum.checked_add(item.minimum_words()))
+                    .ok_or(alloy_sol_types::Error::Overrun)?;
+                dec.set_strict_head_words(head_words)?;
                 buf.to_mut().iter_mut().take(*size).try_for_each(|item| item.decode_populate(dec))
             }
-            Self::DynSeq { .. } => self.decode_populate(dec),
+            Self::DynSeq { .. } => {
+                dec.set_strict_head_words(1)?;
+                self.decode_populate(dec)
+            }
             _ => Err(Error::custom("Called decode_sequence_populate on non-sequence token")),
         }
     }
 
     /// Decode a single item of this type, as a sequence of length 1.
     #[inline]
-    pub(crate) fn decode_single_populate(&mut self, dec: &mut Decoder<'a>) -> Result<()> {
+    pub(crate) fn decode_single_populate(&mut self, dec: &mut Decoder<'a, '_>) -> Result<()> {
         // This is what
         // `Self::FixedSeq(vec![self.clone()], 1).decode_populate()`
         // would do, so we skip the allocation.
