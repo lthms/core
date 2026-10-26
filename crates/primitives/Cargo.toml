@@ -83,6 +83,7 @@ rayon = { workspace = true, optional = true }
 
 # k256
 k256 = { workspace = true, optional = true, features = ["ecdsa"] }
+elliptic-curve = { workspace = true, optional = true }
 
 # secp256k1
 secp256k1 = { workspace = true, optional = true }
@@ -132,6 +133,7 @@ std = [
     "rapidhash?/std",
     "indexmap?/std",
     "k256?/std",
+    "elliptic-curve?/std",
     "secp256k1?/std",
     "secp256k1?/global-context",
     "keccak-asm?/std",
@@ -170,7 +172,7 @@ map-rapidhash = ["map", "dep:rapidhash"]
 map-fxhash = ["map", "dep:rustc-hash"]
 
 getrandom = ["dep:getrandom"]
-k256 = ["dep:k256"]
+k256 = ["dep:k256", "dep:elliptic-curve"]
 secp256k1 = ["dep:secp256k1"]
 rand = [
     "dep:rand",
